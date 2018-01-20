@@ -1,0 +1,36 @@
+use Mojolicious::Lite -signatures;
+
+use lib 'lib';
+
+use Mojo::Pg;
+use Mojo::File;
+use Mojo::Util 'steady_time';
+
+push @{app->commands->namespaces}, 'Bakeoff::Command';
+
+plugin 'Config';
+plugin 'Minion::Admin';
+
+helper source => sub { state $pg = Mojo::Pg->new(app->config('SourcePg')) };
+plugin Minion => {Pg => app->config('MinionPg')};
+
+app->minion->add_task(bakeoff => sub ($job, $id, $batch=1000, $ext='csv', $field_delim="\t", $record_delim="\n") {
+  my $start = steady_time;
+  $job->app->log->debug("Extracting up to $batch records starting at $id and writing to $id.$ext");
+  $job->note(progress => "Start: $start");
+  $job->app->source->db->query_p('select * from a left join b using (id) where id >= ? and id < ? order by id limit ?', $id, $id+$batch, $batch)->then(sub {
+    my $results = shift;
+    my $extracted = steady_time;
+    $job->note(progress => "Extracted: $extracted");
+    $job->app->log->debug(sprintf 'Transforming %s records from batch starting at %s', $results->rows, $id);
+    Mojo::File->new('export')->make_path->child("$id.$ext")->spurt($results->arrays->map(sub{join $field_delim, map { $_ and uc } @$_})->join($record_delim));
+    my $transformed = steady_time;
+    $job->note(progress => "Transformed: $transformed");
+    $job->finish({rows => $results->rows, extracted => $extracted - $start, transformed => $transformed - $start});
+  })->catch(sub {
+    my $err = shift;
+    $job->app->log->error("Error starting at $id: $err"); 
+  })->wait;
+});
+
+app->start;
